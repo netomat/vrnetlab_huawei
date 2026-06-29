@@ -596,8 +596,12 @@ class VM:
         tc filter add dev {MGMT_INTF} ingress prio 1 protocol ip flower ip_proto tcp dst_port 5000-5007 action pass
         # mirror ARP traffic to container
         tc filter add dev {MGMT_INTF} ingress prio 2 protocol arp flower action mirred egress mirror dev tap0
-        # redirect rest of ingress traffic of eth0 to egress of tap0
-        tc filter add dev {MGMT_INTF} ingress prio 3 flower action mirred egress redirect dev tap0
+        # redirect rest of ingress traffic of eth0 to egress of tap0, recomputing
+        # L3/L4 checksums first: the host offloads checksums (CHECKSUM_PARTIAL), and
+        # the tc-mirred path to the VM would otherwise deliver packets with bad
+        # checksums that a checksum-strict NOS (e.g. Huawei VRP) silently drops -
+        # breaking all TCP (SSH/NETCONF) to the mgmt IP while ICMP still works.
+        tc filter add dev {MGMT_INTF} ingress prio 3 flower action csum ip and tcp and udp and icmp pipe action mirred egress redirect dev tap0
 
         tc qdisc add dev tap0 clsact
         # redirect all ingress traffic of tap0 to egress of eth0
@@ -605,6 +609,15 @@ class VM:
 
         # clone management MAC of the VM
         ip link set dev {MGMT_INTF} address {MGMT_MAC}
+
+        # The clab-assigned mgmt IP lives on the container eth0 *and* on the VM.
+        # The MAC clone above is meant to keep them indistinguishable, but some
+        # NOSes (e.g. Huawei VRP) assign their mgmt port a different MAC, so the
+        # container would shadow the VM in ARP (host resolves the v4 mgmt IP to
+        # eth0, not the VM). Make the container never answer ARP for the mgmt IP
+        # so only the VM does. (IPv6 already defers via duplicate-address detection.)
+        sysctl -qw net.ipv4.conf.{MGMT_INTF}.arp_ignore=8 || true
+        sysctl -qw net.ipv4.conf.{MGMT_INTF}.arp_announce=2 || true
         """
 
         ifup_script = ifup_script.replace("{MGMT_INTF}", self.mgmt_intf)
